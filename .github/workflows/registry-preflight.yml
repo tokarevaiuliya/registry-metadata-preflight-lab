@@ -1,0 +1,26 @@
+# Registry metadata preflight — synthetic lab. Manual trigger only. Read-only public registry metadata queries:
+# no secrets, no artifacts, no caches, no Docker pulls, no containers, no third-party actions.
+# The script is pinned by SHA-256; any edit to it must come with a reviewed edit of this pin.
+name: registry-metadata-preflight
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: registry-preflight
+  cancel-in-progress: false
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (pinned commit, credentials not persisted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify the reviewed script
+        timeout-minutes: 1
+        run: echo "8923bcea736d1aaa188d6d95e288e1f1e3bfee6faf221b741965bfc795c8a8ab  registry_preflight.py" | sha256sum -c -
+      - name: Registry metadata preflight (read-only; output to the job summary only)
+        timeout-minutes: 8
+        run: python3 -I registry_preflight.py
