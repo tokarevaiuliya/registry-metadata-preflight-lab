@@ -13,9 +13,19 @@ Network policy (enforced in code before any connection is opened):
     host on that registry's blob-redirect allowlist, at most 2 hops, over HTTPS, and WITHOUT the Authorization header.
   * Response size caps: manifests 4 MiB, configs 1 MiB, tokens 64 KiB. Request budget: 150 for the whole run.
 
+Rate limiting (ECR Public throttles unauthenticated pulls):
+  * Global ECR pacer: at least 2 s between ANY two requests in the ECR flow (token, manifests, config, blob redirect).
+  * HTTP 429 only: at most 3 retries per request; waits come from Retry-After (delta-seconds or HTTP-date, never
+    shorter than the server asks) or, if it is absent/malformed, bounded exponential backoff (4, 8, 16 s). A single
+    wait above 30 s or a cumulative backoff above 120 s stops with RATE_LIMITED instead of waiting.
+  * Whole-run time budget 420 s (inside the 8-minute step timeout). Other 4xx are never retried.
+
 Order and fail-fast: phase 1 verifies the ECR primary for all five images; the first ECR failure stops ALL further
 registry lookups (remaining images: NOT_ATTEMPTED) and the result is BLOCKED. Phase 2 checks the other registries.
 Reaching the request budget also stops all lookups (BLOCKED).
+
+Reference evidence: REFERENCE_DIGESTS holds digests recorded by an earlier, independently reviewed run. When an
+entry exists, a differing ECR value is flagged TAG_DRIFT and the image cannot PASS.
 
 Docker-Content-Digest: optional in the OCI distribution spec. The authority is always the SHA-256 computed from the
 received bytes; a by-digest request must hash to the requested digest. If the header is present it must match (else
@@ -28,6 +38,7 @@ information only. No lock file is created.
 Verdict (exit code): PASS 0 / PARTIAL 3 / BLOCKED 10. A PASS proves registry metadata verification only.
 Output: Markdown + JSON written to $GITHUB_STEP_SUMMARY (if set) and stdout. No files, artifacts or caches.
 """
+import email.utils
 import hashlib
 import http.client
 import json
@@ -80,6 +91,14 @@ DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 CAP_MANIFEST, CAP_CONFIG, CAP_TOKEN = 4 << 20, 1 << 20, 64 << 10
 REQUEST_BUDGET = 150
 TIMEOUT_S = 20
+ECR_MIN_INTERVAL_S = 2.0
+MAX_429_RETRIES = 3
+WAIT_CAP_S = 30.0
+BACKOFF_BUDGET_S = 120.0
+RUN_TIME_BUDGET_S = 420.0
+
+# Digests from an earlier reviewed run, per image: {"postgres": {"tag_digest": "sha256:…", ...}}. Empty = no reference.
+REFERENCE_DIGESTS = {}
 
 
 class PolicyError(Exception):
@@ -95,12 +114,21 @@ class Abort(PolicyError):
 
 
 class Unavailable(Exception):
-    """The source could not be read (HTTP 401/403/404/429, network error)."""
+    """The source could not be read (HTTP 401/403/404, network error)."""
+
+
+class RateLimited(Exception):
+    """HTTP 429 could not be recovered within the retry, wait-cap and backoff limits."""
 
 
 # ----------------------------------------------------------------------------------------------- transport
 _requests_made = 0
 _hosts_contacted = set()
+_now, _sleep, _wall = time.monotonic, time.sleep, time.time     # replaced by a fake clock in offline tests
+_last_request = {}
+_backoff_used = 0.0
+_retries_429 = 0
+_run_started = None
 
 
 def raw_get(host, path, headers, cap):
@@ -126,40 +154,90 @@ def _split(url):
     return u.hostname.lower(), path
 
 
-def _get(url, allowed_hosts, headers, cap):
-    """GET with host allowlist, request budget and limited retries (network errors and 5xx only)."""
-    global _requests_made
+def retry_after_delay(value):
+    """Seconds to wait from a Retry-After header: (delay, kind). kind: seconds | http-date | absent | malformed."""
+    if value is None:
+        return None, "absent"
+    v = value.strip()
+    if re.fullmatch(r"[0-9]{1,6}", v):
+        return float(int(v)), "seconds"
+    try:
+        dt = email.utils.parsedate_to_datetime(v)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None, "malformed"
+    if dt is None or dt.tzinfo is None:
+        return None, "malformed"
+    return max(0.0, dt.timestamp() - _wall()), "http-date"
+
+
+def _check_run_time():
+    if _run_started is not None and _now() - _run_started > RUN_TIME_BUDGET_S:
+        raise Abort("run time budget exhausted")
+
+
+def _pace(reg):
+    if reg == "ecr" and "ecr" in _last_request:
+        wait = ECR_MIN_INTERVAL_S - (_now() - _last_request["ecr"])
+        if wait > 0:
+            _sleep(wait)
+    _check_run_time()
+
+
+def _get(url, allowed_hosts, headers, cap, reg):
+    """GET with host allowlist, request budget, ECR pacing, bounded 429 recovery and limited retries for network
+    errors / 5xx. Never retries other 4xx."""
+    global _requests_made, _backoff_used, _retries_429
     host, path = _split(url)
     if host not in allowed_hosts:
         raise Refused("host not on allowlist: " + host)
     hdrs = dict(headers)
     hdrs["User-Agent"] = "registry-metadata-preflight/1"
     hdrs["Accept-Encoding"] = "identity"
-    last = None
-    for attempt in range(3):
+    net_failures, rl_retries = 0, 0
+    while True:
         if _requests_made >= REQUEST_BUDGET:
             raise Abort("request budget exhausted")
+        _pace(reg)
         _requests_made += 1
         _hosts_contacted.add(host)
+        _last_request[reg] = _now()
         try:
             status, rh, body = raw_get(host, path, hdrs, cap)
         except (OSError, socket.timeout, http.client.HTTPException, ssl.SSLError) as e:
-            last = Unavailable("network error: " + type(e).__name__)
-            time.sleep(2)
+            net_failures += 1
+            if net_failures >= 3:
+                raise Unavailable("network error: " + type(e).__name__)
+            _sleep(2)
             continue
         if status >= 500:
-            last = Unavailable("HTTP %d" % status)
-            time.sleep(2)
+            net_failures += 1
+            if net_failures >= 3:
+                raise Unavailable("HTTP %d" % status)
+            _sleep(2)
+            continue
+        if status == 429:
+            if rl_retries >= MAX_429_RETRIES:
+                raise RateLimited("HTTP 429 persisted after %d retries" % rl_retries)
+            delay, kind = retry_after_delay(rh.get("retry-after"))
+            if delay is None:
+                delay = min(WAIT_CAP_S, 4.0 * (2 ** rl_retries))
+            elif delay > WAIT_CAP_S:
+                raise RateLimited("Retry-After %ds exceeds the %ds wait cap" % (int(delay), int(WAIT_CAP_S)))
+            if _backoff_used + delay > BACKOFF_BUDGET_S:
+                raise RateLimited("429 backoff budget (%ds) would be exceeded" % int(BACKOFF_BUDGET_S))
+            _backoff_used += delay
+            _retries_429 += 1
+            rl_retries += 1
+            _sleep(delay)
             continue
         if len(body) > cap:
             raise PolicyError("response exceeds size cap")
         return status, rh, body
-    raise last
 
 
 def fetch_token(reg, repo):
     url = REGISTRIES[reg]["token"].format(repo=repo)
-    status, _, body = _get(url, {_split(url)[0]}, {"Accept": "application/json"}, CAP_TOKEN)
+    status, _, body = _get(url, {_split(url)[0]}, {"Accept": "application/json"}, CAP_TOKEN, reg)
     if status in (301, 302, 303, 307, 308):
         raise Refused("redirect on token request refused")
     if status != 200:
@@ -177,10 +255,10 @@ def fetch_manifest(reg, repo, ref, token):
     api = REGISTRIES[reg]["api"]
     url = "https://%s/v2/%s/manifests/%s" % (api, repo, ref)
     accept = ", ".join(sorted(INDEX_TYPES | MANIFEST_TYPES))
-    status, rh, body = _get(url, {api}, {"Accept": accept, "Authorization": "Bearer " + token}, CAP_MANIFEST)
+    status, rh, body = _get(url, {api}, {"Accept": accept, "Authorization": "Bearer " + token}, CAP_MANIFEST, reg)
     if status in (301, 302, 303, 307, 308):
         raise Refused("redirect on manifest request refused")
-    if status in (401, 403, 404, 429):
+    if status in (401, 403, 404):
         raise Unavailable("manifest HTTP %d" % status)
     if status != 200:
         raise PolicyError("unexpected manifest HTTP %d" % status)
@@ -211,7 +289,7 @@ def fetch_config(reg, repo, desc, token):
     if not (isinstance(digest, str) and DIGEST_RE.match(digest)) or not isinstance(size, int) or not 0 < size <= CAP_CONFIG:
         raise PolicyError("config descriptor invalid or too large")
     url = "https://%s/v2/%s/blobs/%s" % (api, repo, digest)
-    status, rh, body = _get(url, {api}, {"Authorization": "Bearer " + token}, CAP_CONFIG)
+    status, rh, body = _get(url, {api}, {"Authorization": "Bearer " + token}, CAP_CONFIG, reg)
     hops, via = 0, []
     while status in (301, 302, 303, 307, 308):
         hops += 1
@@ -228,8 +306,8 @@ def fetch_config(reg, repo, desc, token):
             raise Refused("blob redirect to non-allowlisted host refused: " + host)
         via.append(host)
         url = nxt
-        status, rh, body = _get(url, {host}, {}, CAP_CONFIG)  # no Authorization to the storage host
-    if status in (401, 403, 404, 429):
+        status, rh, body = _get(url, {host}, {}, CAP_CONFIG, reg)  # no Authorization to the storage host
+    if status in (401, 403, 404):
         raise Unavailable("config HTTP %d" % status)
     if status != 200:
         raise PolicyError("unexpected config HTTP %d" % status)
@@ -332,6 +410,8 @@ def _attempt(reg, repo, role, tag):
         entry.update(status="REFUSED", detail=str(e))
     except PolicyError as e:
         entry.update(status="INVALID", detail=str(e))
+    except RateLimited as e:
+        entry.update(status="RATE_LIMITED", detail=str(e))
     except Unavailable as e:
         entry.update(status="UNAVAILABLE", detail=str(e))
     return entry, None
@@ -356,11 +436,17 @@ def run():
         rec["ecr"] = entry
         if r is None:
             rec["ecr_verification"] = "FAILED"
-            rec["reason"] = "ECR primary not verified: %s" % entry.get("detail")
-            stop = "fail-fast after ECR failure for %s" % rec["image"]
+            rec["reason"] = "ECR primary not verified (%s): %s" % (entry["status"], entry.get("detail"))
+            stop = "fail-fast after ECR %s for %s" % (entry["status"], rec["image"])
             break
         rec["ecr_verification"] = "VERIFIED"
         primaries[rec["image"]] = r
+        ref = REFERENCE_DIGESTS.get(rec["image"])
+        if ref:
+            drift = [k for k in ("tag_digest", "linux_amd64_manifest_digest", "config_digest") if k in ref and ref[k] != r[k]]
+            rec["reference"] = "TAG_DRIFT: " + ",".join(drift) if drift else "MATCHES_REFERENCE"
+        else:
+            rec["reference"] = "NO_REFERENCE"
     # phase 2 — other registries (only if every primary verified)
     if stop is None:
         for rec in recs:
@@ -406,6 +492,8 @@ def run():
             else:
                 rec["equivalence"], rec["verdict"] = "NO_SECOND_SOURCE", "PARTIAL"
                 rec["reason"] = "ECR verified; no same-publisher source available for comparison"
+            if rec.get("reference", "").startswith("TAG_DRIFT") and rec["verdict"] == "PASS":
+                rec["verdict"], rec["reason"] = "PARTIAL", rec["reference"] + " versus the reviewed reference run; " + rec["reason"]
     for rec in recs:
         rec.pop("_others", None)
     overall = "BLOCKED" if stop or any(r["verdict"] == "BLOCKED" for r in recs) else (
@@ -426,7 +514,9 @@ def render(overall, results, started, stop):
     out = ["# Registry metadata preflight — synthetic lab", "",
            "Overall verdict: %s (metadata verification only; authorizes nothing else)" % overall,
            "Started (UTC): %s · requests: %d · hosts contacted: %s" % (started, _requests_made, ", ".join(sorted(_hosts_contacted)) or "none"),
-           "Stop: %s" % (stop or "none"), "",
+           "Stop: %s" % (stop or "none"),
+           "Rate limiting: ECR pacing %.0fs; HTTP 429 retries %d; backoff used %.0fs of %.0fs" % (
+               ECR_MIN_INTERVAL_S, _retries_429, _backoff_used, BACKOFF_BUDGET_S), "",
            "## 1. ECR primary verification (independent of cross-registry equivalence)",
            "ECR verified: %d/%d" % (sum(r["ecr_verification"] == "VERIFIED" for r in results), len(results)), "", hdr, sep]
     for r in results:
@@ -441,8 +531,8 @@ def render(overall, results, started, stop):
             "| image | comparison | result | note |", "|---|---|---|---|"]
     out += ["| %s | ECR vs %s/%s | %s | %s |" % (r["image"], i["source"]["registry"], i["source"]["repo"], i["result"], i["note"])
             for r in results for i in r["upstream_info"]]
-    out += ["", "## 4. Verdict per image", "", "| image | ECR | equivalence | verdict | reason |", "|---|---|---|---|---|"]
-    out += ["| %s | %s | %s | %s | %s |" % (r["image"], r["ecr_verification"], r["equivalence"], r["verdict"], r["reason"]) for r in results]
+    out += ["", "## 4. Verdict per image", "", "| image | ECR | reference | equivalence | verdict | reason |", "|---|---|---|---|---|---|"]
+    out += ["| %s | %s | %s | %s | %s | %s |" % (r["image"], r["ecr_verification"], r.get("reference", "-"), r["equivalence"], r["verdict"], r["reason"]) for r in results]
     out += ["", "CANDIDATE VALUES — NOT A LOCK (ECR-verified only; subject to independent review):", "```"]
     for r in results:
         s = r["ecr"] if r["ecr_verification"] == "VERIFIED" else None
@@ -451,12 +541,15 @@ def render(overall, results, started, stop):
             "%s:%s %s" % (r["image"], r["tag"], r["ecr_verification"]))
     out += ["```", "", "Machine-readable result:", "```json",
             json.dumps({"overall": overall, "stop": stop, "started_utc": started, "requests": _requests_made,
+                        "retries_429": _retries_429, "backoff_used_s": _backoff_used,
                         "hosts_contacted": sorted(_hosts_contacted), "images": results}, indent=1, sort_keys=True), "```"]
     return "\n".join(out) + "\n"
 
 
 def main():
+    global _run_started
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _run_started = _now()
     try:
         overall, results, stop = run()
     except Exception as e:                       # any unexpected failure is BLOCKED, never PASS

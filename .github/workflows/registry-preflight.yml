@@ -20,7 +20,7 @@ jobs:
           persist-credentials: false
       - name: Verify the reviewed script
         timeout-minutes: 1
-        run: echo "8923bcea736d1aaa188d6d95e288e1f1e3bfee6faf221b741965bfc795c8a8ab  registry_preflight.py" | sha256sum -c -
+        run: echo "de59566102e4efceb74266bcad205309b3e0b7eb77860b1d396cf3f90c59ec9b  registry_preflight.py" | sha256sum -c -
       - name: Registry metadata preflight (read-only; output to the job summary only)
         timeout-minutes: 8
         run: python3 -I registry_preflight.py
